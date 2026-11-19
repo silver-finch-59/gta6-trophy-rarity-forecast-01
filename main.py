@@ -1,5 +1,28 @@
 """GTA VI trophy rarity forecast: earners-over-players power-law model.
 
+REVISION v2 (19 Nov 2026, resubmitted 19 Nov 2026):
+three changes, each validated on the practice proxy AND on synthetic
+final-like worlds (see cand/results.md):
+
+1. RECENT FITS: both slopes (players and per-trophy earners) are now fitted
+   on the last quarter of the history span only, not the whole history.
+   Reason: the house's own recording of the first refresh shows earners
+   CANNOT follow one power law in (1 + hours) -- non-100% earners grew only
+   ~1.3x while players grew ~6x, yet week-one rates must be far above the
+   level a single power law through those two points implies.  The earners
+   curve must accelerate over the week (an S-curve, as players reach each
+   trophy), so a fit over the whole history is dragged down by the early
+   launch-flood phase and systematically underestimates late rates.  The
+   recent slope measures the current regime.  With <= 4 distinct reads the
+   full history is used (flat practice history is unaffected).
+2. REFRESH MEDIAN: the flat-history prior now takes the MEDIAN of the
+   refresh / no-refresh two-point mixture (full jump when p_refresh >= 0.5,
+   no jump otherwise) instead of the probability-weighted log-mean.  The
+   pinball loss scores the median, so the median of the predictive
+   distribution is the right point forecast, not its log-mean.
+3. SIGMA_SCALE 0.85: with the median now much closer to the truth, the
+   spread that minimises pinball loss is narrower.
+
 Forecasts, for each of Grand Theft Auto VI's PS5 trophies, five quantiles of
 its Exophase earn rate at the case's target, as percentages.
 
@@ -81,6 +104,12 @@ PRIOR_N_EXP = 1.0
 REFRESH_HOURS = 4.0
 # Largest log move allowed from a trophy's last rate, in either direction.
 MAX_LOG_MOVE = 3.0
+# Trend slopes are fitted on the last quarter of the history span only (see
+# the v2 note in the module docstring): the recent slope measures the
+# current regime, the early launch-flood phase does not.
+RECENT_FRACTION = 0.75
+# Spread multiplier: the improved median needs a narrower spread.
+SIGMA_SCALE = 0.85
 
 
 def clamp(x: float) -> float:
@@ -247,8 +276,16 @@ def forecast_case(case: dict, name: str) -> dict:
     players_varied = len(set(ns)) > 1
 
     # --- players_tracked growth -------------------------------------------
+    # Recent-only fit (last quarter of the span): the launch-flood phase
+    # has a much steeper N slope than the current regime.
     log_ns = [math.log(max(1.0, n)) for n in ns]
-    slope_n_fit = ols_slope(xs, log_ns) if players_varied else None
+    if players_varied and len(xs) > 4:
+        x_cut = min(xs) + (max(xs) - min(xs)) * RECENT_FRACTION
+        fit_xs = [x for x in xs if x >= x_cut]
+        fit_ns = [y for x, y in zip(xs, log_ns) if x >= x_cut]
+        slope_n_fit = ols_slope(fit_xs, fit_ns)
+    else:
+        slope_n_fit = ols_slope(xs, log_ns) if players_varied else None
     if slope_n_fit is None:
         slope_n = PRIOR_N_EXP
     else:
@@ -282,7 +319,9 @@ def forecast_case(case: dict, name: str) -> dict:
     # The expected log move is the refresh probability times one refresh's
     # log move; with a varied history this term is tiny (the jumps have
     # decayed away by then) and the trend fit below dominates instead.
-    expected_jumps = p_refresh
+    # v2: take the MEDIAN of the two-point refresh mixture, not the
+    # probability-weighted log-mean -- pinball loss scores the median.
+    expected_jumps = 1.0 if p_refresh >= 0.5 else 0.0
 
     # --- spread components --------------------------------------------------
     rw_sigma = 0.5 * math.sqrt(horizon_days)
@@ -314,11 +353,19 @@ def forecast_case(case: dict, name: str) -> dict:
             continue
 
         # --- earners trend fit ----------------------------------------------
+        # Recent-only fit (last quarter of the span): earners accelerate as
+        # players reach each trophy, so the early slope underestimates the
+        # late slope.  With <= 4 distinct reads the full history is used.
+        x_cut = None
+        if len(xs) > 4:
+            x_cut = min(xs) + (max(xs) - min(xs)) * RECENT_FRACTION
         exs: list[float] = []
         eys: list[float] = []
         for read, x in zip(reads, xs):
             r = read["rates"][i]
             if r is None:
+                continue
+            if x_cut is not None and x < x_cut:
                 continue
             earners = max(0.5, float(r) * float(read["players_tracked"]) / 100.0)
             exs.append(x)
@@ -353,7 +400,7 @@ def forecast_case(case: dict, name: str) -> dict:
         # --- spread -----------------------------------------------------------
         sigma_fit = min(0.9, max(0.15, resid)) * (1.0 + dx / max(x_span, 0.5)) if slope_e_fit is not None else 0.5
         sigma = math.sqrt(rw_sigma ** 2 + sigma_fit ** 2 + sigma_extra ** 2)
-        sigma = min(1.8, max(0.4, sigma))
+        sigma = min(1.8, max(0.4, sigma)) * SIGMA_SCALE
 
         rows.append({"id": trophy["id"], "q": quantiles(median, sigma)})
     return {"trophies": rows}
